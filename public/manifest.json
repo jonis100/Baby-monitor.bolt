@@ -1,0 +1,17 @@
+{
+  "name": "Baby Monitor",
+  "short_name": "BabyMon",
+  "description": "Real-time baby audio monitor with WebRTC streaming",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#8b5cf6",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/vite.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
