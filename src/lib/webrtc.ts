@@ -14,6 +14,8 @@ export class WebRTCManager {
   private onRemoteStreamCallback?: (stream: MediaStream) => void;
   private onConnectionStateCallback?: (state: string) => void;
   private signalingChannel: ReturnType<typeof supabase.channel> | null = null;
+  private dbSubscription: ReturnType<typeof supabase.from> | null = null;
+  private processedMessageIds = new Set<string>();
 
   constructor(deviceType: 'baby' | 'parent') {
     this.deviceType = deviceType;
@@ -77,11 +79,17 @@ export class WebRTCManager {
       .on('broadcast', { event: 'signaling' }, async (payload) => {
         await this.handleSignalingMessage(payload.payload);
       })
-      .subscribe();
-
-    if (this.deviceType === 'baby') {
-      await this.createOffer();
-    }
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('Channel subscribed:', roomCode);
+          if (this.deviceType === 'baby') {
+            this.createOffer();
+          } else if (this.deviceType === 'parent') {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await this.loadPendingMessages(roomCode);
+          }
+        }
+      });
   }
 
   private async createOffer() {
@@ -108,12 +116,10 @@ export class WebRTCManager {
       switch (message.messageType) {
         case 'offer':
           if (this.deviceType === 'parent' && message.payload.sdp) {
-            await this.peerConnection.setRemoteDescription(
-              new RTCSessionDescription({
-                sdp: message.payload.sdp,
-                type: message.payload.type as RTCSdpType
-              })
-            );
+            await this.peerConnection.setRemoteDescription({
+              sdp: message.payload.sdp,
+              type: message.payload.type as RTCSdpType
+            });
             const answer = await this.peerConnection.createAnswer();
             await this.peerConnection.setLocalDescription(answer);
             this.sendSignalingMessage('answer', {
@@ -125,26 +131,82 @@ export class WebRTCManager {
 
         case 'answer':
           if (this.deviceType === 'baby' && message.payload.sdp) {
-            await this.peerConnection.setRemoteDescription(
-              new RTCSessionDescription({
-                sdp: message.payload.sdp,
-                type: message.payload.type as RTCSdpType
-              })
-            );
+            await this.peerConnection.setRemoteDescription({
+              sdp: message.payload.sdp,
+              type: message.payload.type as RTCSdpType
+            });
           }
           break;
 
         case 'ice-candidate':
           if (message.payload.candidate) {
-            await this.peerConnection.addIceCandidate(
-              new RTCIceCandidate(message.payload.candidate)
-            );
+            try {
+              await this.peerConnection.addIceCandidate(
+                new RTCIceCandidate(message.payload.candidate)
+              );
+            } catch (e) {
+              console.log('ICE candidate error (can be normal):', e);
+            }
           }
           break;
       }
     } catch (error) {
       console.error('Error handling signaling message:', error);
     }
+  }
+
+  private async loadPendingMessages(roomCode: string) {
+    try {
+      if (!this.roomId) return;
+
+      const { data } = await supabase
+        .from('signaling_messages')
+        .select('*')
+        .eq('room_id', this.roomId)
+        .eq('message_type', 'offer')
+        .eq('sender_type', 'baby')
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (data && data.length > 0) {
+        const message = data[0];
+        console.log('Processing pending offer message');
+        this.processedMessageIds.add(message.id);
+        await this.handleSignalingMessage({
+          senderId: message.sender_id,
+          senderType: message.sender_type,
+          messageType: message.message_type,
+          payload: message.payload as { sdp?: string; type?: string; candidate?: RTCIceCandidateInit }
+        });
+      }
+
+      this.setupDatabaseListener(roomCode);
+    } catch (error) {
+      console.error('Error loading pending messages:', error);
+    }
+  }
+
+  private setupDatabaseListener(roomCode: string) {
+    if (!this.roomId) return;
+
+    supabase
+      .from(`signaling_messages:room_id=eq.${this.roomId}`)
+      .on('*', (payload) => {
+        if (payload.eventType === 'INSERT') {
+          const message = payload.new as any;
+          if (!this.processedMessageIds.has(message.id)) {
+            this.processedMessageIds.add(message.id);
+            console.log('New message from database:', message.message_type);
+            this.handleSignalingMessage({
+              senderId: message.sender_id,
+              senderType: message.sender_type,
+              messageType: message.message_type,
+              payload: message.payload as { sdp?: string; type?: string; candidate?: RTCIceCandidateInit }
+            });
+          }
+        }
+      })
+      .subscribe();
   }
 
   private async sendSignalingMessage(messageType: string, payload: unknown) {
@@ -191,6 +253,11 @@ export class WebRTCManager {
     if (this.signalingChannel) {
       await this.signalingChannel.unsubscribe();
       this.signalingChannel = null;
+    }
+
+    if (this.dbSubscription) {
+      await this.dbSubscription.unsubscribe();
+      this.dbSubscription = null;
     }
 
     if (this.peerConnection) {
