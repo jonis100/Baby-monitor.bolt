@@ -46,7 +46,10 @@ export default function ParentMode() {
   const startListening = async (code: string) => {
     try {
       const normalizedCode = code.toUpperCase().trim();
+      console.log('Attempting to join room:', normalizedCode);
+
       const roomId = await joinRoom(normalizedCode);
+      console.log('Room joined, ID:', roomId);
       roomIdRef.current = roomId;
 
       await requestNotificationPermission();
@@ -54,6 +57,7 @@ export default function ParentMode() {
       webrtcRef.current = new WebRTCManager('parent');
 
       webrtcRef.current.onRemoteStream((stream) => {
+        console.log('Remote stream received');
         if (!audioRef.current) {
           audioRef.current = new Audio();
           audioRef.current.autoplay = true;
@@ -74,9 +78,11 @@ export default function ParentMode() {
       });
 
       webrtcRef.current.onConnectionStateChange((state) => {
+        console.log('Connection state changed:', state);
         setConnectionStatus(state);
       });
 
+      console.log('Connecting to room:', normalizedCode, roomId);
       await webrtcRef.current.connectToRoom(normalizedCode, roomId);
 
       await updateRoomStatus(roomId, { parent_count: 1 });
