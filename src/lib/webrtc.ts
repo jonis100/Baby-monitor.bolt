@@ -6,7 +6,7 @@ const ICE_SERVERS = [
 ];
 
 export class WebRTCManager {
-  private peerConnection: RTCPeerConnection | null = null;
+  private peerConnections: Map<string, RTCPeerConnection> = new Map();
   private localStream: MediaStream | null = null;
   private roomId: string | null = null;
   private deviceId: string;
@@ -16,10 +16,45 @@ export class WebRTCManager {
   private signalingChannel: ReturnType<typeof supabase.channel> | null = null;
   private dbSubscription: ReturnType<typeof supabase.from> | null = null;
   private processedMessageIds = new Set<string>();
+  private remoteDescriptionSet: Map<string, boolean> = new Map();
 
   constructor(deviceType: 'baby' | 'parent') {
     this.deviceType = deviceType;
     this.deviceId = `${deviceType}-${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  private getPeerConnection(peerId: string = 'default'): RTCPeerConnection {
+    if (!this.peerConnections.has(peerId)) {
+      const pc = new RTCPeerConnection({
+        iceServers: ICE_SERVERS
+      });
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          this.sendSignalingMessage('ice-candidate', {
+            candidate: event.candidate.toJSON(),
+            targetPeerId: peerId
+          });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        if (this.onRemoteStreamCallback && event.streams[0]) {
+          this.onRemoteStreamCallback(event.streams[0]);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState || 'unknown';
+        if (this.onConnectionStateCallback) {
+          this.onConnectionStateCallback(state);
+        }
+      };
+
+      this.peerConnections.set(peerId, pc);
+    }
+
+    return this.peerConnections.get(peerId)!;
   }
 
   async startLocalStream(): Promise<MediaStream> {
@@ -41,36 +76,15 @@ export class WebRTCManager {
 
   async connectToRoom(roomCode: string, roomId: string) {
     this.roomId = roomId;
+    this.processedMessageIds.clear();
+    this.remoteDescriptionSet.clear();
 
-    this.peerConnection = new RTCPeerConnection({
-      iceServers: ICE_SERVERS
-    });
-
-    this.peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.sendSignalingMessage('ice-candidate', {
-          candidate: event.candidate.toJSON()
-        });
-      }
-    };
-
-    this.peerConnection.ontrack = (event) => {
-      if (this.onRemoteStreamCallback && event.streams[0]) {
-        this.onRemoteStreamCallback(event.streams[0]);
-      }
-    };
-
-    this.peerConnection.onconnectionstatechange = () => {
-      const state = this.peerConnection?.connectionState || 'unknown';
-      if (this.onConnectionStateCallback) {
-        this.onConnectionStateCallback(state);
-      }
-    };
+    const pc = this.getPeerConnection('default');
 
     if (this.localStream && this.deviceType === 'baby') {
       this.localStream.getTracks().forEach(track => {
-        if (this.localStream && this.peerConnection) {
-          this.peerConnection.addTrack(track, this.localStream);
+        if (this.localStream && pc) {
+          pc.addTrack(track, this.localStream);
         }
       });
     }
@@ -93,10 +107,10 @@ export class WebRTCManager {
   }
 
   private async createOffer() {
-    if (!this.peerConnection) return;
+    const pc = this.getPeerConnection('default');
 
-    const offer = await this.peerConnection.createOffer();
-    await this.peerConnection.setLocalDescription(offer);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
     this.sendSignalingMessage('offer', {
       sdp: offer.sdp,
@@ -108,40 +122,51 @@ export class WebRTCManager {
     senderId: string;
     senderType: string;
     messageType: string;
-    payload: { sdp?: string; type?: string; candidate?: RTCIceCandidateInit };
+    payload: { sdp?: string; type?: string; candidate?: RTCIceCandidateInit; targetPeerId?: string };
   }) {
-    if (!this.peerConnection || message.senderId === this.deviceId) return;
+    if (message.senderId === this.deviceId) return;
+
+    const peerId = message.senderId;
+    const pc = this.getPeerConnection(peerId);
 
     try {
       switch (message.messageType) {
         case 'offer':
           if (this.deviceType === 'parent' && message.payload.sdp) {
-            await this.peerConnection.setRemoteDescription({
-              sdp: message.payload.sdp,
-              type: message.payload.type as RTCSdpType
-            });
-            const answer = await this.peerConnection.createAnswer();
-            await this.peerConnection.setLocalDescription(answer);
+            if (!this.remoteDescriptionSet.get(peerId)) {
+              await pc.setRemoteDescription({
+                sdp: message.payload.sdp,
+                type: message.payload.type as RTCSdpType
+              });
+              this.remoteDescriptionSet.set(peerId, true);
+            }
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
             this.sendSignalingMessage('answer', {
               sdp: answer.sdp,
-              type: answer.type
+              type: answer.type,
+              parentId: this.deviceId
             });
           }
           break;
 
         case 'answer':
           if (this.deviceType === 'baby' && message.payload.sdp) {
-            await this.peerConnection.setRemoteDescription({
-              sdp: message.payload.sdp,
-              type: message.payload.type as RTCSdpType
-            });
+            if (!this.remoteDescriptionSet.get(peerId)) {
+              await pc.setRemoteDescription({
+                sdp: message.payload.sdp,
+                type: message.payload.type as RTCSdpType
+              });
+              this.remoteDescriptionSet.set(peerId, true);
+              console.log('Baby: Remote description set from parent', peerId);
+            }
           }
           break;
 
         case 'ice-candidate':
           if (message.payload.candidate) {
             try {
-              await this.peerConnection.addIceCandidate(
+              await pc.addIceCandidate(
                 new RTCIceCandidate(message.payload.candidate)
               );
             } catch (e) {
@@ -189,7 +214,7 @@ export class WebRTCManager {
   private setupDatabaseListener(roomCode: string) {
     if (!this.roomId) return;
 
-    supabase
+    this.dbSubscription = supabase
       .from(`signaling_messages:room_id=eq.${this.roomId}`)
       .on('*', (payload) => {
         if (payload.eventType === 'INSERT') {
@@ -260,10 +285,10 @@ export class WebRTCManager {
       this.dbSubscription = null;
     }
 
-    if (this.peerConnection) {
-      this.peerConnection.close();
-      this.peerConnection = null;
-    }
+    this.peerConnections.forEach((pc) => {
+      pc.close();
+    });
+    this.peerConnections.clear();
 
     this.stopLocalStream();
   }
